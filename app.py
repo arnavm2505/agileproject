@@ -21,7 +21,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- Load Data ---
+print("hi")# --- Load Data ---
 # Use caching to load data only once
 @st.cache_data
 def load_data(filepath):
