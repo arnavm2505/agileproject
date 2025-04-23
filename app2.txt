@@ -1,0 +1,821 @@
+# -*- coding: utf-8 -*-
+# pylint: disable=too-many-lines
+"""
+Streamlit application for demonstrating a Transaction Fraud Detection System.
+
+This application loads transaction data, performs feature engineering, allows users
+to train a Random Forest model, and make predictions on new transaction data.
+"""
+
+# --- Standard Library Imports ---
+import time
+import logging
+
+# --- Third-party Imports ---
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    precision_recall_curve,
+    auc,
+)
+
+# --- Constants ---
+# Filepath for the dataset
+DATA_FILEPATH = "datalab_export_2025-04-16 15_55_17.csv"
+# Target variable name
+TARGET_COLUMN = 'is_fraud'
+# Earth radius in kilometers for distance calculation
+EARTH_RADIUS_KM = 6371
+# Default number of columns for input layout
+INPUT_LAYOUT_COLS = 3
+
+# --- Logging Configuration ---
+# Configure logging for potential debugging (optional)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Page Configuration ---
+st.set_page_config(
+    page_title="Fraud Detection System",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --- Data Loading and Feature Engineering ---
+
+@st.cache_data
+def _engineer_datetime_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineers datetime features: hour, dayofweek, month, and age.
+
+    Args:
+        df: Input DataFrame with 'trans_date_trans_time' and 'dob' columns.
+
+    Returns:
+        DataFrame with added datetime features and calculated 'age'.
+    """
+    df_eng = df.copy()
+    try:
+        # Convert to datetime objects, coercing errors
+        df_eng['trans_date_trans_time'] = pd.to_datetime(
+            df_eng['trans_date_trans_time'], errors='coerce'
+        )
+        df_eng['dob'] = pd.to_datetime(df_eng['dob'], errors='coerce')
+
+        # Extract features from transaction time
+        df_eng['trans_hour'] = df_eng['trans_date_trans_time'].dt.hour
+        df_eng['trans_dayofweek'] = df_eng['trans_date_trans_time'].dt.dayofweek
+        df_eng['trans_month'] = df_eng['trans_date_trans_time'].dt.month
+
+        # Calculate Age at time of transaction
+        valid_dates = df_eng['trans_date_trans_time'].notna() & df_eng['dob'].notna()
+        df_eng['age'] = np.nan  # Initialize age column
+        # Calculate age in days and convert to years (approximate)
+        age_in_days = (
+            df_eng.loc[valid_dates, 'trans_date_trans_time'] - df_eng.loc[valid_dates, 'dob']
+        ).dt.days
+        df_eng.loc[valid_dates, 'age'] = age_in_days / 365.25
+
+        # Handle potential invalid ages (e.g., negative if dob is after trans_date)
+        df_eng['age'] = df_eng['age'].apply(lambda x: x if pd.notna(x) and x > 0 else np.nan)
+
+        # Fill missing age with the median age
+        median_age = df_eng['age'].median()
+        if pd.notna(median_age):
+            df_eng['age'] = df_eng['age'].fillna(median_age)
+            logging.info("Filled missing age values with median: %.1f", median_age)
+        else:
+            logging.warning("Could not calculate median age, potential NaNs remain in 'age'.")
+            # Fallback: fill with 0 or another placeholder if median calculation fails
+            df_eng['age'] = df_eng['age'].fillna(0)
+
+    except KeyError as key_err:
+        st.error(f"Error during date/time feature engineering: Missing column {key_err}")
+        st.warning("Date-related features might be missing or incorrect.")
+    except Exception as e: # pylint: disable=broad-except
+        st.error(f"An unexpected error occurred during date/time feature engineering: {e}")
+        logging.error("Date/Time FE error: %s", e, exc_info=True)
+        st.warning("Date-related features might be missing or incorrect.")
+
+    return df_eng
+
+@st.cache_data
+def _engineer_location_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Engineers location features: distance between customer and merchant.
+
+    Args:
+        df: Input DataFrame with 'lat', 'long', 'merch_lat', 'merch_long'.
+
+    Returns:
+        DataFrame with added 'distance_km' feature.
+    """
+    df_eng = df.copy()
+    try:
+        # Convert degrees to radians for Haversine formula
+        lat1_rad = np.radians(df_eng['lat'])
+        lon1_rad = np.radians(df_eng['long'])
+        lat2_rad = np.radians(df_eng['merch_lat'])
+        lon2_rad = np.radians(df_eng['merch_long'])
+
+        # Calculate differences
+        delta_lon = lon2_rad - lon1_rad
+        delta_lat = lat2_rad - lat1_rad
+
+        # Haversine formula components
+        # pylint: disable=invalid-name # a, c are standard Haversine notations
+        a = np.sin(delta_lat / 2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(delta_lon / 2)**2
+        c = 2 * np.arcsin(np.sqrt(a))
+
+        # Calculate distance
+        df_eng['distance_km'] = c * EARTH_RADIUS_KM
+
+        # Handle potential NaN distances (if lat/long missing) - fill with median
+        median_dist = df_eng['distance_km'].median()
+        if pd.notna(median_dist):
+            df_eng['distance_km'] = df_eng['distance_km'].fillna(median_dist)
+            logging.info("Calculated customer-merchant distance. Filled missing with median: %.2f km", median_dist)
+        else:
+            logging.warning("Could not calculate median distance. NaNs may remain in 'distance_km'.")
+            # Fallback: fill with 0 or another value if median fails
+            df_eng['distance_km'] = df_eng['distance_km'].fillna(0)
+
+    except KeyError as key_err:
+        st.error(f"Error calculating distance: Missing column {key_err}")
+        st.warning("Distance feature might be missing or incorrect.")
+    except Exception as e: # pylint: disable=broad-except
+        st.error(f"An unexpected error occurred calculating distance: {e}")
+        logging.error("Distance FE error: %s", e, exc_info=True)
+        st.warning("Distance feature might be missing or incorrect.")
+
+    return df_eng
+
+@st.cache_data
+def load_and_prepare_data(filepath: str) -> pd.DataFrame | None:
+    """
+    Loads data from a CSV file, cleans column names, and performs feature engineering.
+
+    Args:
+        filepath: The path to the CSV file.
+
+    Returns:
+        A pandas DataFrame with processed data and engineered features, or None if loading fails.
+    """
+    try:
+        # Load the CSV, handle potential BOM (like ï»¿)
+        df = pd.read_csv(filepath, encoding='utf-8-sig')
+        logging.info("Successfully loaded data from %s", filepath)
+
+        # Clean column names (remove quotes, spaces, lowercase)
+        df.columns = df.columns.str.replace('"', '', regex=False).str.strip().str.replace(' ', '_', regex=False).str.lower()
+        logging.info("Cleaned column names: %s", df.columns.tolist())
+
+        # --- Feature Engineering ---
+        logging.info("Starting feature engineering...")
+        df = _engineer_datetime_features(df)
+        df = _engineer_location_features(df)
+        logging.info("Feature engineering complete.")
+        logging.info("Final columns after FE: %s", df.columns.tolist())
+
+        return df
+
+    except FileNotFoundError:
+        st.error(f"Error: File not found at {filepath}")
+        logging.error("File not found: %s", filepath)
+        return None
+    except pd.errors.EmptyDataError:
+        st.error(f"Error: File at {filepath} is empty.")
+        logging.error("Empty data file: %s", filepath)
+        return None
+    except Exception as e: # pylint: disable=broad-except
+        st.error(f"An unexpected error occurred loading or processing data: {e}")
+        logging.error("Data loading/processing error: %s", e, exc_info=True)
+        return None
+
+# --- Load Data ---
+raw_data = load_and_prepare_data(DATA_FILEPATH)
+
+# --- Define Features and Columns (after data is loaded) ---
+# These are defined here to be accessible globally within the script's context.
+# Pylint might prefer them inside functions, but for Streamlit structure this is common.
+# pylint: disable=invalid-name
+if raw_data is not None:
+    # Define features based on potentially available columns after engineering
+    # Feature Selection (Adjust based on analysis and desired complexity)
+    potential_numerical_features = [
+        'amt', 'city_pop',
+        # Engineered features:
+        'trans_hour', 'trans_dayofweek', 'trans_month', 'age', 'distance_km'
+    ]
+    # Note: Original lat/long are dropped later if distance_km is used
+    potential_categorical_features = ['category', 'state']
+
+    # Ensure all selected features actually exist after engineering
+    all_available_cols = raw_data.columns.tolist()
+    NUMERICAL_FEATURES = [f for f in potential_numerical_features if f in all_available_cols]
+    CATEGORICAL_FEATURES = [f for f in potential_categorical_features if f in all_available_cols]
+
+    FEATURES = CATEGORICAL_FEATURES + NUMERICAL_FEATURES
+
+    # Columns to drop before training (IDs, original cols replaced by engineered ones)
+    potential_drop_cols = [
+        'index', 'trans_date_trans_time', 'merchant', 'first', 'last', 'gender',
+        'street', 'city', 'zip', 'job', 'dob', 'trans_num', 'unix_time',
+        'cc_num', # Added common sensitive/ID columns
+        'lat', 'long', 'merch_lat', 'merch_long' # Drop original lat/long if distance_km exists
+    ]
+    # Remove 'distance_km' check dependency for dropping lat/long if distance_km failed creation
+    DROP_COLS = [
+        col for col in potential_drop_cols
+        if col in all_available_cols and col != TARGET_COLUMN and col not in FEATURES
+    ]
+
+    # --- Final Data Validation ---
+    # Ensure TARGET exists
+    if TARGET_COLUMN not in all_available_cols:
+        st.error(f"Target column '{TARGET_COLUMN}' not found in the dataset!")
+        logging.critical("Target column '%s' missing!", TARGET_COLUMN)
+        raw_data = None  # Invalidate data
+
+    # Check for missing features after filtering
+    elif not FEATURES:
+        st.error("No valid features selected or found after feature engineering!")
+        logging.critical("No features available for modeling!")
+        raw_data = None
+    else:
+        logging.info("Selected Numerical Features: %s", NUMERICAL_FEATURES)
+        logging.info("Selected Categorical Features: %s", CATEGORICAL_FEATURES)
+        logging.info("Final Features for Model: %s", FEATURES)
+        logging.info("Columns to Drop: %s", DROP_COLS)
+        # Prepare the final DataFrame for the app by dropping unnecessary columns
+        cols_to_keep = FEATURES + [TARGET_COLUMN]
+        # Ensure only existing columns are selected
+        cols_to_keep = [col for col in cols_to_keep if col in raw_data.columns]
+        processed_data = raw_data[cols_to_keep].copy()
+        logging.info("Created final processed_data with shape %s", processed_data.shape)
+
+else:
+    processed_data = None # Ensure variable exists even if loading fails
+    # Define empty lists if data loading fails to avoid NameErrors later
+    NUMERICAL_FEATURES = []
+    CATEGORICAL_FEATURES = []
+    FEATURES = []
+    DROP_COLS = []
+# pylint: enable=invalid-name
+
+# --- Helper Functions ---
+
+def create_preprocessor(
+    numerical_features: list[str], categorical_features: list[str]
+) -> ColumnTransformer:
+    """
+    Creates a ColumnTransformer for preprocessing numerical and categorical features.
+
+    Args:
+        numerical_features: List of names of numerical features.
+        categorical_features: List of names of categorical features.
+
+    Returns:
+        A scikit-learn ColumnTransformer object.
+
+    Raises:
+        ValueError: If no features are provided for preprocessing.
+    """
+    transformers = []
+    if numerical_features:
+        numerical_transformer = Pipeline(steps=[('scaler', StandardScaler())])
+        transformers.append(('num', numerical_transformer, numerical_features))
+        logging.info("Added StandardScaler for numerical features: %s", numerical_features)
+
+    if categorical_features:
+        # Using OneHotEncoder - suitable for Random Forest.
+        categorical_transformer = Pipeline(steps=[
+            ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))
+        ])
+        transformers.append(('cat', categorical_transformer, categorical_features))
+        logging.info("Added OneHotEncoder for categorical features: %s", categorical_features)
+
+    if not transformers:
+        logging.error("No features provided to create_preprocessor.")
+        raise ValueError("No features selected for preprocessing!")
+
+    # 'remainder=drop' is generally safer if FEATURES accurately lists all used columns
+    preprocessor = ColumnTransformer(transformers=transformers, remainder='drop')
+    return preprocessor
+
+def plot_confusion_matrix_func(conf_matrix: np.ndarray, classes: list[str]) -> plt.Figure:
+    """
+    Plots a confusion matrix using seaborn heatmap.
+
+    Args:
+        conf_matrix: The confusion matrix (numpy array).
+        classes: List of class names for labels.
+
+    Returns:
+        matplotlib Figure object containing the plot.
+    """
+    fig, axis = plt.subplots(figsize=(6, 4))
+    sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues',
+                xticklabels=classes, yticklabels=classes, ax=axis)
+    axis.set_xlabel('Predicted labels')
+    axis.set_ylabel('True labels')
+    axis.set_title('Confusion Matrix')
+    logging.info("Generated confusion matrix plot.")
+    return fig
+
+def plot_precision_recall_curve_func(y_true: np.ndarray, y_scores: np.ndarray) -> plt.Figure:
+    """
+    Plots the Precision-Recall curve and calculates AUC-PR.
+
+    Args:
+        y_true: True binary labels.
+        y_scores: Target scores (probabilities or decision function).
+
+    Returns:
+        matplotlib Figure object containing the plot.
+    """
+    precision, recall, _ = precision_recall_curve(y_true, y_scores)
+    pr_auc = auc(recall, precision)
+    fig, axis = plt.subplots(figsize=(6, 4))
+    axis.plot(recall, precision, marker='.', label=f'PR Curve (AUC = {pr_auc:.2f})')
+    axis.set_xlabel('Recall')
+    axis.set_ylabel('Precision')
+    axis.set_title('Precision-Recall Curve')
+    axis.legend()
+    axis.grid(True)
+    logging.info("Generated Precision-Recall curve plot with AUC: %.2f", pr_auc)
+    return fig
+
+# --- Streamlit App Layout ---
+st.title("🛡️ Transaction Fraud Detection System")
+st.write("""
+Welcome to the Fraud Detection System. This app analyzes transaction data to identify
+potentially fraudulent activities. Use the sidebar to navigate between sections.
+""")
+
+# --- Sidebar Navigation ---
+st.sidebar.header("Navigation")
+APP_MODES = ["Data Overview", "Model Training", "Make Prediction"]
+app_mode = st.sidebar.radio(
+    "Choose a section:",
+    APP_MODES
+)
+
+# --- Main App Logic ---
+if processed_data is None:
+    st.error(
+        "Dataset could not be loaded or processed correctly. "
+        "Please check the file path, file integrity, and feature engineering steps."
+    )
+    logging.critical("Stopping Streamlit app execution due to data loading/processing failure.")
+    st.stop()  # Stop execution if data isn't loaded/processed
+
+# --- 1. Data Overview Section ---
+if app_mode == "Data Overview":
+    st.header("📊 Data Overview")
+    st.write("Sample of Processed Data (Selected Features + Target):")
+    st.dataframe(processed_data.head())
+
+    st.subheader("Dataset Information")
+    st.write(f"Shape: {processed_data.shape[0]} rows, {processed_data.shape[1]} columns")
+
+    st.subheader("Basic Statistics (Numerical Features)")
+    if NUMERICAL_FEATURES:
+        # Show stats only for the numerical features we plan to use
+        st.dataframe(processed_data[NUMERICAL_FEATURES].describe())
+    else:
+        st.warning("No numerical features selected or available to describe.")
+
+    st.subheader(f"Fraud Distribution ('{TARGET_COLUMN}')")
+    if TARGET_COLUMN in processed_data.columns:
+        fraud_counts = processed_data[TARGET_COLUMN].value_counts()
+        st.write(fraud_counts)
+        fig_dist, ax_dist = plt.subplots(figsize=(6, 4))
+        sns.countplot(x=TARGET_COLUMN, data=processed_data, ax=ax_dist, palette="viridis")
+        ax_dist.set_title("Distribution of Fraud Target (0: Not Fraud, 1: Fraud)")
+        ax_dist.set_xlabel("Fraud Status")
+        ax_dist.set_ylabel("Count")
+        ax_dist.set_xticks([0, 1])
+        ax_dist.set_xticklabels(['Not Fraud (0)', 'Fraud (1)'])
+        st.pyplot(fig_dist)
+    else:
+        # This case should theoretically not happen due to earlier checks
+        st.warning(f"Target column '{TARGET_COLUMN}' not found for distribution plot.")
+
+    st.subheader("Feature Distributions (Sample)")
+    if NUMERICAL_FEATURES:
+        # Provide default selection if list is not empty
+        default_feature = NUMERICAL_FEATURES[0] if NUMERICAL_FEATURES else None
+        selected_feature = st.selectbox(
+            "Select a numerical feature to visualize:",
+            NUMERICAL_FEATURES,
+            index=NUMERICAL_FEATURES.index(default_feature) if default_feature else 0
+        )
+        if selected_feature and TARGET_COLUMN in processed_data.columns:
+            fig_hist, ax_hist = plt.subplots(figsize=(8, 4))
+            sns.histplot(data=processed_data, x=selected_feature, kde=True,
+                         hue=TARGET_COLUMN, palette="muted", ax=ax_hist)
+            ax_hist.set_title(
+                f"Distribution of {selected_feature.replace('_', ' ').title()} by Fraud Status"
+            )
+            st.pyplot(fig_hist)
+        elif not TARGET_COLUMN in processed_data.columns:
+            st.warning(f"Target column '{TARGET_COLUMN}' needed for distribution hue.")
+        # Removed redundant 'else' check for selected_feature as selectbox handles it
+    else:
+        st.write("No numerical features available for distribution plots.")
+
+    st.subheader("Correlation Heatmap (Numerical Features)")
+    if NUMERICAL_FEATURES and TARGET_COLUMN in processed_data.columns:
+        cols_for_corr = NUMERICAL_FEATURES + [TARGET_COLUMN]
+        numerical_data_for_corr = processed_data[cols_for_corr].copy()
+
+        # Handle potential infinite values resulting from calculations (e.g., distance)
+        # Replacing large finite values as well, as they can skew correlation
+        numerical_data_for_corr = numerical_data_for_corr.replace([np.inf, -np.inf], np.nan)
+        # Check for NaNs introduced or remaining
+        if numerical_data_for_corr.isnull().any().any():
+            nan_cols = numerical_data_for_corr.columns[numerical_data_for_corr.isnull().any()].tolist()
+            st.warning(f"NaNs detected in columns for correlation: {nan_cols}. "
+                       "Attempting to fill with median before calculating correlation.")
+            for col in nan_cols:
+                median_val = numerical_data_for_corr[col].median()
+                if pd.notna(median_val):
+                    numerical_data_for_corr[col] = numerical_data_for_corr[col].fillna(median_val)
+                else: # Fallback if median is NaN
+                    numerical_data_for_corr[col] = numerical_data_for_corr[col].fillna(0)
+
+        if not numerical_data_for_corr.empty:
+            try:
+                correlation_matrix = numerical_data_for_corr.corr()
+                fig_corr, ax_corr = plt.subplots(figsize=(10, 8))
+                sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', fmt=".2f",
+                            ax=ax_corr, annot_kws={"size": 8})
+                plt.xticks(rotation=45, ha='right')
+                plt.yticks(rotation=0)
+                ax_corr.set_title("Correlation Matrix of Numerical Features and Target")
+                st.pyplot(fig_corr)
+            except Exception as e: # pylint: disable=broad-except
+                 st.error(f"Could not generate correlation heatmap: {e}")
+                 logging.error("Correlation heatmap generation failed: %s", e, exc_info=True)
+        else:
+             st.warning("No data available to generate correlation heatmap after cleaning.")
+
+    else:
+        st.write(
+            "Cannot generate correlation heatmap. Need numerical features and the target column."
+        )
+
+
+# --- 2. Model Training Section ---
+elif app_mode == "Model Training":
+    st.header("🤖 Model Training")
+    st.write("Train a Random Forest Classifier to detect fraudulent transactions.")
+
+    # --- Training Parameters ---
+    col_params1, col_params2 = st.columns(2)
+    with col_params1:
+        test_size = st.slider("Test Set Size (%)", 10, 50, 25, 5) / 100.0
+        random_state = st.number_input("Random State for Splitting", value=42, step=1, min_value=0)
+    with col_params2:
+        n_estimators = st.slider("Number of Trees (n_estimators)", min_value=50,
+                                max_value=500, value=100, step=10)
+        # Using 0 for None is confusing, let's use a checkbox or specific value
+        max_depth_option = st.number_input(
+            "Max Depth of Trees (Enter 0 for None)",
+             min_value=0, max_value=50, value=10, step=1
+        )
+        max_depth_val = None if max_depth_option == 0 else max_depth_option
+
+    # --- Train Button ---
+    if st.button("Train Fraud Detection Model", type="primary", key="train_model_button"):
+        st.write("Starting model training...")
+        progress_bar = st.progress(0, text="Initializing...")
+        status_text = st.empty()
+
+        try:
+            # 1. Prepare Data for Modeling
+            status_text.text("Preparing data...")
+            progress_bar.progress(5, text="Preparing data...")
+            # Use the already processed_data which has only FEATURES + TARGET
+            X = processed_data[FEATURES].copy()
+            y = processed_data[TARGET_COLUMN].copy()
+
+            # Final check for NaNs that might have slipped through
+            if X.isnull().any().any():
+                st.warning(f"NaNs detected in features before training: "
+                           f"{X.isnull().sum().sum()}. Attempting to fill.")
+                logging.warning("NaNs detected in features before training.")
+                # Fill numerical NaNs with median
+                for col in X.select_dtypes(include=np.number).columns:
+                    if X[col].isnull().any():
+                        median_val = X[col].median()
+                        X[col] = X[col].fillna(median_val if pd.notna(median_val) else 0)
+                        logging.info("Filled NaNs in numerical feature '%s' with %s", col, median_val)
+                # Fill categorical NaNs with mode
+                for col in X.select_dtypes(include='object').columns:
+                    if X[col].isnull().any():
+                        mode_val = X[col].mode()
+                        # Use mode()[0] in case of multiple modes, handle empty mode
+                        fill_value = mode_val[0] if not mode_val.empty else "Unknown"
+                        X[col] = X[col].fillna(fill_value)
+                        logging.info("Filled NaNs in categorical feature '%s' with '%s'", col, fill_value)
+
+            if y.isnull().any():
+                st.error(f"Target column '{TARGET_COLUMN}' contains NaN values after processing. "
+                         "Cannot train model. Please check data cleaning steps.")
+                logging.critical("NaNs found in target column '%s' before training.", TARGET_COLUMN)
+                raise ValueError(f"NaNs in target column '{TARGET_COLUMN}'")
+
+            # --- Data Splitting ---
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y, test_size=test_size, random_state=random_state,
+                stratify=y  # Stratify is important for imbalanced fraud data
+            )
+            progress_bar.progress(20, text="Data split complete.")
+            st.write(f"Training data shape: {X_train.shape}")
+            st.write(f"Test data shape: {X_test.shape}")
+            logging.info("Data split into train (%s) and test (%s) sets.", X_train.shape, X_test.shape)
+
+
+            # 2. Create Preprocessor and Model Pipeline
+            status_text.text("Building preprocessing and model pipeline...")
+            progress_bar.progress(30, text="Building pipeline...")
+            preprocessor = create_preprocessor(NUMERICAL_FEATURES, CATEGORICAL_FEATURES)
+
+            # Define the Random Forest model with selected parameters
+            rf_classifier = RandomForestClassifier(
+                    n_estimators=n_estimators,
+                    max_depth=max_depth_val,
+                    random_state=random_state,
+                    class_weight='balanced',  # Crucial for imbalanced fraud datasets
+                    n_jobs=-1,                # Use all available CPU cores
+                    min_samples_split=10,     # Add some regularization
+                    min_samples_leaf=5
+                )
+
+            model_pipeline = Pipeline(steps=[
+                ('preprocessor', preprocessor),
+                ('classifier', rf_classifier)
+            ])
+            logging.info("Created model pipeline with preprocessor and RandomForest.")
+            progress_bar.progress(40, text="Pipeline built.")
+
+            # 3. Train the Model
+            status_text.text(f"Training Random Forest with {n_estimators} trees "
+                             f"(max_depth={max_depth_val or 'None'})...")
+            progress_bar.progress(50, text="Training model...")
+            start_time = time.time()
+            model_pipeline.fit(X_train, y_train)
+            end_time = time.time()
+            training_time = end_time - start_time
+            logging.info("Model training finished in %.2f seconds.", training_time)
+            progress_bar.progress(80, text="Model trained.")
+
+            # 4. Evaluate the Model
+            status_text.text("Evaluating model...")
+            progress_bar.progress(90, text="Evaluating...")
+            y_pred = model_pipeline.predict(X_test)
+            # Ensure predict_proba is available and use it for metrics needing probabilities
+            if hasattr(model_pipeline, "predict_proba"):
+                 y_pred_proba = model_pipeline.predict_proba(X_test)[:, 1] # Probability of fraud (class 1)
+                 roc_auc = roc_auc_score(y_test, y_pred_proba)
+                 logging.info("Calculated ROC AUC score: %.4f", roc_auc)
+            else:
+                 y_pred_proba = None # Model might not support probabilities (though RF does)
+                 roc_auc = None
+                 st.warning("Model does not support probability predictions (predict_proba). ROC AUC cannot be calculated.")
+                 logging.warning("predict_proba not available for ROC AUC calculation.")
+
+
+            accuracy = accuracy_score(y_test, y_pred)
+            report = classification_report(y_test, y_pred, target_names=['Not Fraud (0)', 'Fraud (1)'])
+            conf_matrix = confusion_matrix(y_test, y_pred)
+
+            progress_bar.progress(100, text="Evaluation complete.")
+            status_text.success(f"Model training completed in {training_time:.2f} seconds!")
+            logging.info("Model evaluation complete. Accuracy: %.4f", accuracy)
+
+            # 5. Display Results
+            st.subheader("Model Performance Metrics")
+            metric_col1, metric_col2, metric_col3 = st.columns(3)
+            metric_col1.metric("Accuracy", f"{accuracy:.4f}")
+            metric_col1.caption("Note: Accuracy can be misleading in imbalanced datasets.")
+
+            if roc_auc is not None:
+                metric_col2.metric("ROC AUC Score", f"{roc_auc:.4f}")
+                metric_col2.caption("Area Under the ROC Curve - better for imbalance.")
+            else:
+                metric_col2.metric("ROC AUC Score", "N/A")
+
+            metric_col3.metric("Training Time", f"{training_time:.2f} s")
+
+
+            st.subheader("Classification Report")
+            st.text(report)
+            st.caption("Focus on Precision, Recall, and F1-score for the 'Fraud (1)' class.")
+
+
+            plot_col1, plot_col2 = st.columns(2)
+            with plot_col1:
+                st.subheader("Confusion Matrix")
+                fig_cm = plot_confusion_matrix_func(conf_matrix, classes=['Not Fraud', 'Fraud'])
+                st.pyplot(fig_cm)
+
+            with plot_col2:
+                st.subheader("Precision-Recall Curve")
+                if y_pred_proba is not None:
+                    fig_pr = plot_precision_recall_curve_func(y_test, y_pred_proba)
+                    st.pyplot(fig_pr)
+                else:
+                    st.info("Precision-Recall curve cannot be generated without probability scores.")
+
+
+            # Store model and necessary info in session state for prediction
+            st.session_state['fraud_model_pipeline'] = model_pipeline
+            st.session_state['features_used_for_training'] = FEATURES
+            st.session_state['numerical_features_list'] = NUMERICAL_FEATURES
+            st.session_state['categorical_features_list'] = CATEGORICAL_FEATURES
+            # Store a sample or stats of the data for generating input fields
+            st.session_state['training_data_sample_stats'] = processed_data[FEATURES].agg(['min', 'max', 'mean', 'median']).to_dict()
+            st.session_state['training_data_unique_cats'] = {
+                col: processed_data[col].unique().tolist() for col in CATEGORICAL_FEATURES
+            }
+
+
+            st.success("Model trained and saved in session state for making predictions.")
+            logging.info("Model and relevant info saved to Streamlit session state.")
+
+        except ValueError as val_err:
+            st.error(f"Configuration or Data Error: {val_err}")
+            logging.error("ValueError during training: %s", val_err, exc_info=True)
+            status_text.error("Training failed due to data or configuration issue.")
+            progress_bar.empty()
+        except MemoryError:
+            st.error("Memory Error: The dataset or model might be too large for the available RAM.")
+            logging.error("MemoryError during training.", exc_info=True)
+            status_text.error("Training failed due to insufficient memory.")
+            progress_bar.empty()
+        except Exception as e: # pylint: disable=broad-except
+            st.error(f"An unexpected error occurred during training: {e}")
+            logging.error("Unexpected error during training: %s", e, exc_info=True)
+            status_text.error("Training failed unexpectedly.")
+            progress_bar.empty() # Clear progress bar on error
+
+# --- 3. Make Prediction Section ---
+elif app_mode == "Make Prediction":
+    st.header("🔮 Predict Transaction Fraud Risk")
+
+    if 'fraud_model_pipeline' not in st.session_state:
+        st.warning("Please train a model first in the 'Model Training' section.")
+        logging.warning("Prediction attempt without a trained model in session state.")
+    else:
+        st.write("Enter the transaction details based on the features used for training:")
+
+        # Retrieve the trained model and necessary info
+        model_pipeline = st.session_state['fraud_model_pipeline']
+        features_used = st.session_state['features_used_for_training']
+        numerical_features = st.session_state['numerical_features_list']
+        categorical_features = st.session_state['categorical_features_list']
+        feature_stats = st.session_state['training_data_sample_stats']
+        unique_cats = st.session_state['training_data_unique_cats']
+
+        # Create input fields dynamically based on FEATURES
+        user_input_data = {}
+        input_cols = st.columns(INPUT_LAYOUT_COLS) # Create columns for inputs
+
+        current_col_index = 0
+        for feature in features_used:
+            # Cycle through columns for layout
+            target_input_col = input_cols[current_col_index % INPUT_LAYOUT_COLS]
+            with target_input_col:
+                feature_label = feature.replace('_', ' ').title()
+
+                if feature in categorical_features:
+                    # Get unique values, handle potential NaNs stored as strings/objects
+                    options = unique_cats.get(feature, ["N/A"])
+                    options = [str(opt) for opt in options if pd.notna(opt)] # Ensure strings, remove NaN
+                    if not options: options = ["N/A"] # Fallback
+
+                    # Try to find a reasonable default (first option)
+                    default_index = 0
+                    user_input_data[feature] = st.selectbox(
+                        f"{feature_label}:",
+                        options=options,
+                        key=f"input_{feature}",
+                        index=default_index
+                    )
+                elif feature in numerical_features:
+                    # Get stats for range setting, provide fallbacks
+                    stats = feature_stats.get(feature, {})
+                    min_val = float(stats.get('min', 0.0))
+                    max_val = float(stats.get('max', 1000.0))
+                    # Use mean or median as default, fallback to midpoint
+                    default_val = float(stats.get('mean', stats.get('median', (min_val + max_val) / 2)))
+
+                    # Ensure min_val <= default_val <= max_val
+                    default_val = max(min_val, min(default_val, max_val))
+
+                    # Define a reasonable step, avoid zero step if min=max
+                    step_val = (max_val - min_val) / 100 if (max_val > min_val) else 1.0
+                    if step_val <= 0: step_val = 1.0 # Ensure positive step
+
+                    # Use appropriate format based on potential values (e.g., amount vs age)
+                    num_format = "%.4f" if feature in ['amt', 'distance_km'] else "%.2f"
+
+                    user_input_data[feature] = st.number_input(
+                        f"{feature_label}:",
+                        min_value=min_val,
+                        max_value=max_val,
+                        value=default_val,
+                        step=step_val,
+                        key=f"input_{feature}",
+                        format=num_format
+                    )
+                else:
+                    # This case should not happen if FEATURES list is correct
+                    st.warning(f"Feature '{feature}' has an unknown type (not in numerical/categorical lists). Skipping input.")
+                    logging.warning("Feature '%s' not found in numerical or categorical lists during input generation.", feature)
+
+            current_col_index += 1
+
+        # --- Predict Button ---
+        if st.button("Predict Fraud Risk", type="primary", key="predict_button"):
+            # Create a DataFrame from the user inputs with the correct column order
+            try:
+                input_df = pd.DataFrame([user_input_data])
+                # Reorder columns to match the order used during training
+                input_df = input_df[features_used]
+                logging.info("Created input DataFrame for prediction: %s", input_df.to_dict('records')[0])
+
+                st.write("Input Data for Prediction:")
+                st.dataframe(input_df)
+
+                # Make prediction
+                prediction_result = model_pipeline.predict(input_df)[0]
+                prediction_proba = model_pipeline.predict_proba(input_df)[0]
+
+                # Display result
+                st.subheader("Prediction Result:")
+                is_fraud = (prediction_result == 1)
+                fraud_probability = prediction_proba[1]
+
+                if is_fraud:
+                    st.error(f"🚨 Alert: High risk of FRAUD detected! (Prediction: {prediction_result})")
+                    logging.warning("Fraud detected for input: %s, Probability: %.4f", user_input_data, fraud_probability)
+                else:
+                    st.success(f"✅ Status: Transaction appears to be legitimate. (Prediction: {prediction_result})")
+                    logging.info("Legitimate transaction predicted for input: %s, Probability: %.4f", user_input_data, fraud_probability)
+
+                # Display probability metric
+                st.metric("Fraud Probability", f"{fraud_probability:.4f}")
+                # Optional: Display probability of not fraud
+                # st.write(f"Probability of Not Fraud: {prediction_proba[0]:.4f}")
+
+                # --- Logging Simulation ---
+                st.subheader("Logging Prediction (Simulation)")
+                log_entry = {
+                    'timestamp': pd.Timestamp.now().isoformat(),
+                    'inputs': user_input_data,
+                    'prediction': int(prediction_result), # Log as 0 or 1
+                    'prediction_label': 'Fraud' if is_fraud else 'Not Fraud',
+                    'probability_fraud': float(fraud_probability),
+                    'model_info': { # Example metadata
+                         'type': type(model_pipeline.named_steps['classifier']).__name__,
+                         'params': model_pipeline.named_steps['classifier'].get_params(deep=False) # Log shallow params
+                     }
+                    # 'user_id': st.session_state.get('user_id', 'anonymous') # Example if auth exists
+                }
+                st.json(log_entry) # Display what would be logged
+                logging.info("Simulated logging of prediction: %s", log_entry)
+                st.caption(
+                    "In a production system, this prediction and its details would be logged "
+                    "to a database or monitoring system for auditing and potential alerting."
+                )
+
+            except KeyError as key_err:
+                 st.error(f"Prediction Error: Missing feature in input data: {key_err}. "
+                         "This might happen if the feature lists changed after training.")
+                 logging.error("KeyError during prediction preparation: %s", key_err, exc_info=True)
+            except Exception as e: # pylint: disable=broad-except
+                st.error(f"An unexpected error occurred during prediction: {e}")
+                st.error("Please ensure all input fields have valid values and the model is loaded correctly.")
+                logging.error("Unexpected error during prediction: %s", e, exc_info=True)
+
+# --- Footer (Optional) ---
+st.sidebar.markdown("---")
+st.sidebar.info("Fraud Detection System v1.0\nUsing Streamlit & Scikit-learn")
+
+# --- End of File ---
